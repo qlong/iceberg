@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.spark.data;
 
+import java.util.List;
 import org.apache.iceberg.expressions.PathUtil;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.spark.sql.types.ArrayType;
@@ -37,7 +38,8 @@ import org.apache.spark.sql.types.VariantType;
 /**
  * Utilities for Spark variant extraction pushdown ({@code __VARIANT_METADATA_KEY}).
  *
- * <p>Path parsing ({@link #isSupportedExtractionPath}) delegates to {@link PathUtil}.
+ * <p>Path parsing ({@link #parseObjectPath}, {@link #isArrayIndexPart}, {@link
+ * #isSupportedExtractionPath}) delegates to {@link PathUtil}.
  */
 public class SparkVariantExtractionUtil {
   public static final String VARIANT_METADATA_KEY = "__VARIANT_METADATA_KEY";
@@ -94,8 +96,7 @@ public class SparkVariantExtractionUtil {
 
   /**
    * Returns true when Spark pushdown can materialize the extraction target type from shredded
-   * variant columns. Must stay in sync with the SparkVariantExtractionReaders cast support added in
-   * the selective Parquet reader change (see https://github.com/apache/iceberg/pull/16714).
+   * variant columns. Must stay in sync with {@link SparkVariantExtractionReaders} cast support.
    */
   public static boolean isSupportedPushdownTargetType(DataType targetType) {
     if (targetType == null || targetType instanceof VariantType) {
@@ -150,5 +151,28 @@ public class SparkVariantExtractionUtil {
     }
 
     return metadata.getString("path");
+  }
+
+  /**
+   * Returns true when the given path part represents a numeric array index, e.g. {@code "[0]"}.
+   * Array index parts are encoded as {@code "[N]"} strings in the list returned by {@link
+   * #parseObjectPath}.
+   */
+  public static boolean isArrayIndexPart(String part) {
+    return PathUtil.isArrayIndexPart(part);
+  }
+
+  /**
+   * Parses a JSON path like {@code $.size}, {@code $.actor.login}, {@code $['city']}, or {@code
+   * $.commits[0].author.name} into a list of path steps.
+   *
+   * <p>Object field steps are returned as plain strings. Array index steps are returned as {@code
+   * "[N]"} strings (e.g. {@code "[0]"}). These can be distinguished using {@link
+   * #isArrayIndexPart}.
+   *
+   * <p>Delegates to {@link PathUtil#parseObjectPath}.
+   */
+  public static List<String> parseObjectPath(String jsonPath) {
+    return PathUtil.parseObjectPath(jsonPath);
   }
 }
