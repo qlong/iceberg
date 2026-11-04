@@ -18,13 +18,16 @@
  */
 package org.apache.iceberg.arrow.vectorized;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatNoException;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.util.List;
 import java.util.stream.Stream;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.parquet.TypeWithSchemaVisitor;
+import org.apache.iceberg.parquet.VectorizedReader;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.types.Types.IntegerType;
 import org.apache.iceberg.types.Types.NestedField;
 import org.apache.iceberg.types.Types.VariantType;
@@ -156,7 +159,7 @@ public class TestVectorizedReaderBuilder {
   }
 
   @Test
-  void projectingShreddedVariantUnsupported() {
+  void projectingShreddedVariantUsesShreddedReader() {
     Schema icebergSchema =
         new Schema(
             NestedField.required(1, "id", IntegerType.get()),
@@ -171,14 +174,22 @@ public class TestVectorizedReaderBuilder {
             .addField(shreddedVariant(Type.Repetition.OPTIONAL, 2, "data"))
             .named("table");
 
+    List<VectorizedReader<?>> fieldReaders = Lists.newArrayList();
     VectorizedReaderBuilder builder =
         new VectorizedReaderBuilder(
-            icebergSchema, parquetSchema, false, ImmutableMap.of(), readers -> null);
+            icebergSchema,
+            parquetSchema,
+            false,
+            ImmutableMap.of(),
+            readers -> {
+              fieldReaders.addAll(readers);
+              return null;
+            });
 
-    assertThatThrownBy(
-            () -> TypeWithSchemaVisitor.visit(icebergSchema.asStruct(), parquetSchema, builder))
-        .isInstanceOf(UnsupportedOperationException.class)
-        .hasMessage("Unsupported variant: shredded typed_value primitive");
+    TypeWithSchemaVisitor.visit(icebergSchema.asStruct(), parquetSchema, builder);
+
+    assertThat(fieldReaders)
+        .hasAtLeastOneElementOfType(VectorizedArrowReader.ShreddedVariantReader.class);
   }
 
   private static MessageType parquetSchemaWithVariant() {

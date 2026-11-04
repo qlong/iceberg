@@ -19,10 +19,12 @@
 package org.apache.iceberg.spark.sql;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.tuple;
 
 import java.io.File;
 import java.io.IOException;
 import java.util.List;
+import java.util.stream.Stream;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.apache.iceberg.DataFile;
@@ -50,10 +52,13 @@ import org.apache.spark.sql.execution.SparkPlan;
 import org.apache.spark.sql.execution.datasources.v2.BatchScanExec;
 import org.apache.spark.types.variant.Variant;
 import org.apache.spark.unsafe.types.VariantVal;
+import org.assertj.core.groups.Tuple;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import scala.collection.JavaConverters;
 
@@ -557,6 +562,73 @@ public class TestSparkVariantRead extends TestBase {
     sql("DROP TABLE IF EXISTS %s", noStatsTable);
   }
 
+  private static Stream<Arguments> shreddedVariantsWithoutBounds() {
+    return Stream.of(
+        Arguments.of(
+            "array",
+            "(1, parse_json('{\"commits\":[{\"author\":{\"name\":\"alice\"}}]}')), "
+                + "(2, parse_json('{\"commits\":[{\"author\":{\"name\":\"bob\"}}]}')), "
+                + "(3, null)",
+            "$.commits[0].author.name",
+            new Tuple[] {tuple(1L, "alice"), tuple(2L, "bob"), tuple(3L, null)}),
+        Arguments.of(
+            "type differs from inferred",
+            "(1, parse_json('{\"x\":1.5}')), (2, parse_json('{\"x\":\"a\"}')), (3, null)",
+            "$.x",
+            new Tuple[] {tuple(1L, "1.5"), tuple(2L, "a"), tuple(3L, null)}));
+  }
+
+  @ParameterizedTest(name = "{0}")
+  @MethodSource("shreddedVariantsWithoutBounds")
+  public void vectorizedReadShreddedWithoutBounds(
+      String description, String values, String path, Tuple[] expected)
+      throws IOException, NoSuchTableException, ParseException {
+    String noBoundsTable = CATALOG + ".default.var_shredded_no_bounds";
+    sql("DROP TABLE IF EXISTS %s", noBoundsTable);
+    sql(
+        "CREATE TABLE %s (id BIGINT, v VARIANT) USING iceberg TBLPROPERTIES ('format-version'='3')",
+        noBoundsTable);
+
+    // write one file whose shredded layout is inferred from its first row only
+    spark.conf().set("spark.sql.iceberg.shred-variants", "true");
+    spark.conf().set("spark.sql.iceberg.variant-inference-buffer-size", "1");
+    try {
+      sql(
+          "INSERT INTO %s SELECT /*+ COALESCE(1) */ * FROM VALUES %s AS t(id, v)",
+          noBoundsTable, values);
+    } finally {
+      spark.conf().unset("spark.sql.iceberg.shred-variants");
+      spark.conf().unset("spark.sql.iceberg.variant-inference-buffer-size");
+    }
+
+    Table table = Spark3Util.loadIcebergTable(spark, noBoundsTable);
+    assertHasTypedValueSubtree(table);
+    assertHasNoVariantLowerBounds(table);
+    setVectorization(noBoundsTable, true);
+
+    List<Row> rows = Lists.newArrayList();
+    SparkPlan plan =
+        executeAndKeepPlan(
+            () ->
+                rows.addAll(
+                    spark
+                        .sql(
+                            String.format(
+                                "SELECT id, variant_get(v, '%s', 'string') FROM %s",
+                                path, noBoundsTable))
+                        .collectAsList()));
+
+    assertThat(rows)
+        .extracting(r -> r.getLong(0), r -> r.getString(1))
+        .containsExactlyInAnyOrder(expected);
+    assertThat(JavaConverters.seqAsJavaList(plan.collectLeaves()))
+        .singleElement()
+        .isInstanceOfSatisfying(
+            BatchScanExec.class, scan -> assertThat(scan.supportsColumnar()).isTrue());
+
+    sql("DROP TABLE IF EXISTS %s", noBoundsTable);
+  }
+
   private void setVectorization(boolean on) {
     sql(
         "ALTER TABLE %s SET TBLPROPERTIES ('read.parquet.vectorization.enabled'='%s')",
@@ -594,5 +666,17 @@ public class TestSparkVariantRead extends TestBase {
       }
     }
     return false;
+  }
+
+  private static void assertHasNoVariantLowerBounds(Table table) throws IOException {
+    int variantId = table.schema().findField("v").fieldId();
+    try (CloseableIterable<FileScanTask> tasks = table.newScan().includeColumnStats().planFiles()) {
+      assertThat(tasks).isNotEmpty();
+      for (FileScanTask task : tasks) {
+        assertThat(task.file().lowerBounds())
+            .as("Shredded file %s should have no variant lower bound", task.file().location())
+            .doesNotContainKey(variantId);
+      }
+    }
   }
 }

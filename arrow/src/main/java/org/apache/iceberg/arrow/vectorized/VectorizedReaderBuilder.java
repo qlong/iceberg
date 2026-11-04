@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.arrow.vectorized;
 
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.function.BiFunction;
@@ -27,13 +28,17 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.arrow.ArrowAllocation;
 import org.apache.iceberg.arrow.vectorized.VectorizedArrowReader.ConstantVectorReader;
+import org.apache.iceberg.parquet.ParquetValueReader;
+import org.apache.iceberg.parquet.ParquetValueReaders;
 import org.apache.iceberg.parquet.ParquetVariantVisitor;
 import org.apache.iceberg.parquet.TypeWithSchemaVisitor;
+import org.apache.iceberg.parquet.VariantReaderBuilder;
 import org.apache.iceberg.parquet.VectorizedReader;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.types.Types;
+import org.apache.iceberg.variants.Variant;
 import org.apache.parquet.column.ColumnDescriptor;
 import org.apache.parquet.schema.GroupType;
 import org.apache.parquet.schema.MessageType;
@@ -41,6 +46,9 @@ import org.apache.parquet.schema.PrimitiveType;
 import org.apache.parquet.schema.Type;
 
 public class VectorizedReaderBuilder extends TypeWithSchemaVisitor<VectorizedReader<?>> {
+  private static final String METADATA = "metadata";
+  private static final String TYPED_VALUE = "typed_value";
+
   private final MessageType parquetSchema;
   private final Schema icebergSchema;
   private final BufferAllocator rootAllocator;
@@ -158,8 +166,9 @@ public class VectorizedReaderBuilder extends TypeWithSchemaVisitor<VectorizedRea
   @Override
   public ParquetVariantVisitor<VectorizedReader<?>> variantVisitor() {
     // skip variants that are not projected, like primitives, so their shredded layout is not read
+    // shredded variants are read by variant(), which reconstructs each value from typed_value
     Type variant = parquetSchema.getType(currentPath());
-    if (variant.getId() == null || icebergSchema.findField(variant.getId().intValue()) == null) {
+    if (projectedField(variant) == null || isShredded(variant)) {
       return null;
     }
 
@@ -170,7 +179,38 @@ public class VectorizedReaderBuilder extends TypeWithSchemaVisitor<VectorizedRea
   @Override
   public VectorizedReader<?> variant(
       Types.VariantType iVariant, GroupType variant, VectorizedReader<?> result) {
+    Types.NestedField field = projectedField(variant);
+    if (result == null && field != null && isShredded(variant)) {
+      return shreddedVariantReader(field, variant);
+    }
+
     return result;
+  }
+
+  @SuppressWarnings("unchecked")
+  private VectorizedReader<?> shreddedVariantReader(Types.NestedField field, GroupType variant) {
+    String[] path = currentPath();
+    ParquetValueReader<Variant> reader =
+        (ParquetValueReader<Variant>)
+            ParquetVariantVisitor.visit(
+                variant, new VariantReaderBuilder(parquetSchema, Arrays.asList(path)));
+    int definitionLevel = parquetSchema.getMaxDefinitionLevel(path) - 1;
+    String[] metadataPath = Arrays.copyOf(path, path.length + 1);
+    metadataPath[path.length] = METADATA;
+
+    return new VectorizedArrowReader.ShreddedVariantReader(
+        field,
+        parquetSchema.getColumnDescription(metadataPath),
+        ParquetValueReaders.option(variant, definitionLevel, reader),
+        rootAllocator);
+  }
+
+  private Types.NestedField projectedField(Type variant) {
+    return variant.getId() != null ? icebergSchema.findField(variant.getId().intValue()) : null;
+  }
+
+  private static boolean isShredded(Type variant) {
+    return variant.asGroupType().containsField(TYPED_VALUE);
   }
 
   @Override

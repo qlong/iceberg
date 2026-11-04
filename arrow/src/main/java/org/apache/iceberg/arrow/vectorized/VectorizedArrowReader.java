@@ -18,6 +18,8 @@
  */
 package org.apache.iceberg.arrow.vectorized;
 
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.Map;
 import java.util.Optional;
 import org.apache.arrow.memory.ArrowBuf;
@@ -36,6 +38,7 @@ import org.apache.arrow.vector.TimeStampMicroTZVector;
 import org.apache.arrow.vector.TimeStampMicroVector;
 import org.apache.arrow.vector.TimeStampNanoTZVector;
 import org.apache.arrow.vector.TimeStampNanoVector;
+import org.apache.arrow.vector.VarBinaryVector;
 import org.apache.arrow.vector.types.FloatingPointPrecision;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
@@ -45,9 +48,11 @@ import org.apache.iceberg.arrow.ArrowAllocation;
 import org.apache.iceberg.arrow.ArrowSchemaUtil;
 import org.apache.iceberg.arrow.vectorized.parquet.VectorizedColumnIterator;
 import org.apache.iceberg.parquet.ParquetUtil;
+import org.apache.iceberg.parquet.ParquetValueReader;
 import org.apache.iceberg.parquet.VectorizedReader;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.types.Types;
+import org.apache.iceberg.variants.Variant;
 import org.apache.parquet.column.ColumnDescriptor;
 import org.apache.parquet.column.Dictionary;
 import org.apache.parquet.column.page.PageReadStore;
@@ -1091,6 +1096,122 @@ public class VectorizedArrowReader implements VectorizedReader<VectorHolder> {
     @Override
     public String toString() {
       return "VectorizedVariantReader";
+    }
+  }
+
+  static class ShreddedVariantReader extends VectorizedArrowReader {
+    private static final int UNUSED_FIELD_ID = -1;
+    private static final int INITIAL_BUFFER_SIZE = 1024;
+    private static final Types.NestedField METADATA_FIELD =
+        Types.NestedField.required(UNUSED_FIELD_ID, "metadata", Types.BinaryType.get());
+    private static final Types.NestedField VALUE_FIELD =
+        Types.NestedField.optional(UNUSED_FIELD_ID, "value", Types.BinaryType.get());
+
+    private final ColumnDescriptor metadataDescriptor;
+    private final ParquetValueReader<Variant> reader;
+    private final BufferAllocator allocator;
+    private int batchSize = DEFAULT_BATCH_SIZE;
+    private VarBinaryVector metadataVector;
+    private VarBinaryVector valueVector;
+    private NullabilityHolder nulls;
+    private ByteBuffer buffer =
+        ByteBuffer.allocate(INITIAL_BUFFER_SIZE).order(ByteOrder.LITTLE_ENDIAN);
+
+    ShreddedVariantReader(
+        Types.NestedField icebergField,
+        ColumnDescriptor metadataDescriptor,
+        ParquetValueReader<Variant> reader,
+        BufferAllocator allocator) {
+      super(icebergField);
+      this.metadataDescriptor = metadataDescriptor;
+      this.reader = reader;
+      this.allocator = allocator;
+    }
+
+    @Override
+    public VectorHolder read(VectorHolder reuse, int numValsToRead) {
+      prepareVectors(numValsToRead);
+
+      for (int row = 0; row < numValsToRead; row += 1) {
+        Variant variant = reader.read(null);
+        if (variant == null) {
+          nulls.setNull(row);
+          metadataVector.setNull(row);
+          valueVector.setNull(row);
+        } else {
+          nulls.setNotNull(row);
+
+          int metadataSize = variant.metadata().sizeInBytes();
+          variant.metadata().writeTo(buffer(metadataSize), 0);
+          metadataVector.setSafe(row, buffer, 0, metadataSize);
+
+          int valueSize = variant.value().sizeInBytes();
+          variant.value().writeTo(buffer(valueSize), 0);
+          valueVector.setSafe(row, buffer, 0, valueSize);
+        }
+      }
+
+      metadataVector.setValueCount(numValsToRead);
+      valueVector.setValueCount(numValsToRead);
+
+      return new VectorHolder.VariantVectorHolder(
+          icebergField(),
+          numValsToRead,
+          new VectorHolder(metadataDescriptor, metadataVector, false, null, nulls, METADATA_FIELD),
+          // the value column may be absent, so the metadata descriptor supplies the binary type
+          new VectorHolder(metadataDescriptor, valueVector, false, null, nulls, VALUE_FIELD));
+    }
+
+    private void prepareVectors(int numRows) {
+      if (metadataVector == null) {
+        this.metadataVector = new VarBinaryVector(METADATA_FIELD.name(), allocator);
+        this.valueVector = new VarBinaryVector(VALUE_FIELD.name(), allocator);
+        metadataVector.allocateNew(batchSize);
+        valueVector.allocateNew(batchSize);
+      } else {
+        metadataVector.reset();
+        valueVector.reset();
+      }
+
+      if (nulls == null || nulls.size() < numRows) {
+        this.nulls = new NullabilityHolder(Math.max(batchSize, numRows));
+      } else {
+        nulls.reset();
+      }
+    }
+
+    private ByteBuffer buffer(int size) {
+      if (buffer.capacity() < size) {
+        this.buffer =
+            ByteBuffer.allocate(Math.max(size, buffer.capacity() * 2))
+                .order(ByteOrder.LITTLE_ENDIAN);
+      }
+
+      return buffer;
+    }
+
+    @Override
+    public void setRowGroupInfo(
+        PageReadStore source, Map<ColumnPath, ColumnChunkMetaData> metadata) {
+      reader.setPageSource(source);
+    }
+
+    @Override
+    public void setBatchSize(int batchSize) {
+      this.batchSize = (batchSize == 0) ? DEFAULT_BATCH_SIZE : batchSize;
+    }
+
+    @Override
+    public void close() {
+      if (metadataVector != null) {
+        metadataVector.close();
+        valueVector.close();
+      }
+    }
+
+    @Override
+    public String toString() {
+      return "ShreddedVariantReader";
     }
   }
 }
